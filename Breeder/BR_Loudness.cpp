@@ -1043,35 +1043,40 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 	int mode = integratedOnly ? EBUR128_MODE_I : EBUR128_MODE_M | EBUR128_MODE_S | EBUR128_MODE_I | EBUR128_MODE_LRA;
 	if (!integratedOnly && doTruePeak)
 		mode |= EBUR128_MODE_TRUE_PEAK;
-	loudnessState = ebur128_init((size_t)data.channels, (size_t)data.samplerate, mode);
+
+	// set the number of channels we actually are going to use
+	int relevantChannels = data.channels;
 
 	// Ignore channels according to channel mode. Note: we can't partially request samples, i.e. channel mode is mono, but take is stereo...asking for
 	// 1 channel only won't work. We must always request the real channel count even though reaper interleaves active channels starting from 0
+	// channel mode, 0=normal, 1=reverse stereo, 2=downmix, 3=left, 4=right
 	if (data.channelMode > 1)
 	{
 		// Mono channel modes
 		if (data.channelMode <= 66)
-		{	
+		{
 			if (doDualMonoMode) {
 				// Actually there's a check in ebur128_set_channel() for dual mono mode:
 				// if ebur128_init() is called with channels > 1 than dual mono mode is disabled.
 				// But it's ok because if source channels > 1 and set to mono channel modes,
 				// AudioAccessor returns dual mono anyway (what we want)
 				// so we can use stereo channel map in this case
+				relevantChannels = 2;
+				loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
 				ebur128_set_channel(loudnessState, 0, EBUR128_DUAL_MONO);
 				ebur128_set_channel(loudnessState, 1, EBUR128_RIGHT);
-				for (int i = 2; i <= data.channels; ++i)
-					ebur128_set_channel(loudnessState, i, EBUR128_UNUSED);
 			}
 			else {
+				relevantChannels = 1;
+				loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
 				ebur128_set_channel(loudnessState, 0, EBUR128_LEFT);
-				for (int i = 1; i <= data.channels; ++i)
-					ebur128_set_channel(loudnessState, i, EBUR128_UNUSED);
 			}
 		}
 		// Stereo channel modes
 		else
 		{
+			relevantChannels = 2;
+			loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
 			ebur128_set_channel(loudnessState, 0, EBUR128_LEFT);
 			ebur128_set_channel(loudnessState, 1, EBUR128_RIGHT);
 			for (int i = 2; i <= data.channels; ++i)
@@ -1081,18 +1086,27 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 	// Dual mono mode for mono takes
 	else if (doDualMonoMode && _this->m_take && data.channels == 1)
 	{
+		relevantChannels = 1;
+		loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
 		ebur128_set_channel(loudnessState, 0, EBUR128_DUAL_MONO);
-		for (int i = 1; i <= data.channels; ++i)
-			ebur128_set_channel(loudnessState, i, EBUR128_UNUSED);
 	}
 	// Normal channel mode
-	else
+	else if (data.channels <= 6)
 	{
+		loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
 		ebur128_set_channel(loudnessState, 0, EBUR128_LEFT);
 		ebur128_set_channel(loudnessState, 1, EBUR128_RIGHT);
 		ebur128_set_channel(loudnessState, 2, EBUR128_CENTER);
-		ebur128_set_channel(loudnessState, 3, EBUR128_LEFT_SURROUND);
-		ebur128_set_channel(loudnessState, 4, EBUR128_RIGHT_SURROUND);
+		ebur128_set_channel(loudnessState, 3, EBUR128_UNUSED); // LFE
+		ebur128_set_channel(loudnessState, 4, EBUR128_LEFT_SURROUND);
+		ebur128_set_channel(loudnessState, 5, EBUR128_RIGHT_SURROUND);
+	} else
+	{
+		// ADD AMBIX CHANNEL MODE -> Set all but 1st channel to EBUR128_UNUSED
+		// ambisonic file
+		relevantChannels = 1;
+		loudnessState = ebur128_init((size_t)relevantChannels, (size_t)data.samplerate, mode);
+		ebur128_set_channel(loudnessState, 0, EBUR128_LEFT); // should this be EBUR128_DUAL_MONO ?
 	}
 
 	bool doShortTerm = true;
@@ -1115,7 +1129,7 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 	const double audioLength = data.audioEnd - data.audioStart;
 
 	int sampleCount = data.samplerate / refreshRateInHz;
-	int bufSz = sampleCount * data.channels;
+	int bufSz = sampleCount * relevantChannels;
 	double currentTime = data.audioStart;
 	bool momentaryFilled = true;
 	int processedSamples = 0;
@@ -1129,14 +1143,14 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 		if (remainingTime < bufferTime + numeric_limits<double>::epsilon())
 		{
 			sampleCount = static_cast<int>(data.samplerate * remainingTime);
-			bufSz = sampleCount * data.channels;
+			bufSz = sampleCount * relevantChannels;
 			skipIntervals = true;
 		}
 
 		// Get new 200 ms (or 10 ms in high precision mode) of samples
 		// GetAudioAccessorSamples() stops writing to the buffer once it reaches the item's end, everything from that point to sampleCount is garbage
 		std::vector<double> samples(bufSz);
-		GetAudioAccessorSamples(data.audio, data.samplerate, data.channels, currentTime, sampleCount, &samples[0]);
+		GetAudioAccessorSamples(data.audio, data.samplerate, relevantChannels, currentTime, sampleCount, &samples[0]);
 
 		// Correct for volume and pan/volume envelopes
 		int currentChannel = 1;
@@ -1149,7 +1163,7 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 			// Volume envelopes
 			if (doVolPreFXEnv)
 				adjust *= data.volEnvPreFX.ValueAtPosition(sampleTime, true);
-			if (doVolEnv) 
+			if (doVolEnv)
 				adjust *= data.volEnv.ValueAtPosition(sampleTime + itemPos, true);
 
 			// Volume fader
@@ -1166,10 +1180,10 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 
 			sample *= adjust;
 
-			if (++currentChannel > data.channels)
+			if (++currentChannel > relevantChannels)
 				currentChannel = 1;
 
-			if (currentChannel + 1 > data.channels)
+			if (currentChannel + 1 > relevantChannels)
 				sampleTime = sampleTime + sampleTimeLen;
 		}
 
@@ -1233,7 +1247,7 @@ unsigned WINAPI BR_LoudnessObject::AnalyzeData (void* loudnessObject)
 			ebur128_loudness_range(loudnessState, &range);
 			if (doTruePeak)
 			{
-				for (int i = 0; i < data.channels; ++i)
+				for (int i = 0; i < relevantChannels; ++i)
 				{
 					double channelTruePeak, channelTruePeakPos;
 					ebur128_true_peak(loudnessState, i, &channelTruePeak, &channelTruePeakPos);
